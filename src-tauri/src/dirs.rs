@@ -4,6 +4,35 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static BUNDLED_MODULES: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_resource_dir(resource_dir: PathBuf) {
+    let _ = BUNDLED_MODULES.set(resource_dir.join("modules"));
+}
+
+pub fn bundled_modules_dir() -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("PEAKACTIVITY_HELPERS_DIR") { return Some(path.into()); }
+    }
+    BUNDLED_MODULES.get().cloned()
+}
+
+pub fn trusted_helper(path: &std::path::Path, name: &str) -> bool {
+    let Some(root) = bundled_modules_dir() else { return false; };
+    trusted_helper_under(&root, path, name)
+}
+
+fn trusted_helper_under(root: &std::path::Path, path: &std::path::Path, name: &str) -> bool {
+    if !matches!(name, "aw-watcher-window" | "aw-watcher-afk" | "aw-awatcher") { return false; }
+    let Ok(root) = root.canonicalize() else { return false; };
+    let expected = root.join(name).join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    match (path.canonicalize(), expected.canonicalize()) {
+        (Ok(actual), Ok(expected)) => actual == expected && actual.starts_with(&root),
+        _ => false,
+    }
+}
 
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
@@ -21,8 +50,8 @@ lazy_static! {
 pub fn get_config_dir() -> Result<PathBuf, ()> {
     let dir = dirs::config_dir()
         .ok_or(())?
-        .join("activitywatch")
-        .join("aw-tauri");
+        .join("peakactivity")
+        .join("desktop");
     fs::create_dir_all(&dir).expect("Unable to create config dir");
     Ok(dir)
 }
@@ -36,8 +65,8 @@ pub fn get_config_dir() -> Result<PathBuf, ()> {
 pub fn get_data_dir() -> Result<PathBuf, ()> {
     let dir = dirs::data_dir()
         .ok_or(())?
-        .join("activitywatch")
-        .join("aw-tauri");
+        .join("peakactivity")
+        .join("desktop");
     fs::create_dir_all(&dir).expect("Unable to create data dir");
     Ok(dir)
 }
@@ -55,8 +84,8 @@ pub fn get_log_dir() -> Result<PathBuf, ()> {
     // Linux uses cache dir for logs
     let dir = dirs::cache_dir()
         .ok_or(())?
-        .join("activitywatch")
-        .join("aw-tauri")
+        .join("peakactivity")
+        .join("desktop")
         .join("log");
     fs::create_dir_all(&dir).expect("Unable to create log dir");
     Ok(dir)
@@ -67,9 +96,9 @@ pub fn get_log_dir() -> Result<PathBuf, ()> {
     // Windows: %LOCALAPPDATA%\activitywatch\Logs\aw-tauri
     let dir = dirs::data_local_dir()
         .ok_or(())?
-        .join("activitywatch")
+        .join("peakactivity")
         .join("Logs")
-        .join("aw-tauri");
+        .join("desktop");
     fs::create_dir_all(&dir).expect("Unable to create log dir");
     Ok(dir)
 }
@@ -85,8 +114,8 @@ pub fn get_log_dir() -> Result<PathBuf, ()> {
         .ok_or(())?
         .join("Library")
         .join("Logs")
-        .join("activitywatch")
-        .join("aw-tauri");
+        .join("peakactivity")
+        .join("desktop");
     fs::create_dir_all(&dir).expect("Unable to create log dir");
     Ok(dir)
 }
@@ -113,8 +142,8 @@ pub fn get_runtime_dir() -> PathBuf {
     // Linux: use XDG_RUNTIME_DIR or fallback to cache dir
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(runtime_dir)
-            .join("activitywatch")
-            .join("aw-tauri");
+            .join("peakactivity")
+            .join("desktop");
         if let Ok(_) = fs::create_dir_all(&dir) {
             return dir;
         }
@@ -122,8 +151,8 @@ pub fn get_runtime_dir() -> PathBuf {
     // Fallback to cache dir
     let dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("activitywatch")
-        .join("aw-tauri");
+        .join("peakactivity")
+        .join("desktop");
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -158,8 +187,8 @@ pub fn get_discovery_paths() -> Vec<PathBuf> {
                 .unwrap_or_else(|_| home_path.join(".local").join("share"));
             discovery_paths.push(
                 data_dir
-                    .join("activitywatch")
-                    .join("aw-tauri")
+                    .join("peakactivity")
+                    .join("desktop")
                     .join("modules"),
             );
 
@@ -174,7 +203,7 @@ pub fn get_discovery_paths() -> Vec<PathBuf> {
         if let Ok(username) = std::env::var("USERNAME") {
             discovery_paths.push(PathBuf::from(format!(r"C:/Users/{}/aw-modules", username)));
             discovery_paths.push(PathBuf::from(format!(
-                r"C:/Users/{}/AppData/Local/Programs/ActivityWatch",
+                r"C:/Users/{}/AppData/Local/Programs/PeakActivity",
                 username
             )));
         }
@@ -225,6 +254,30 @@ pub fn set_android_data_dir(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_requires_the_exact_resource_path_and_cannot_escape_it() {
+        let directory = std::env::temp_dir().join(format!("peak-helper-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let modules = directory.join("modules");
+        let name = "aw-watcher-window";
+        let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let trusted = modules.join(name).join(&executable);
+        fs::create_dir_all(trusted.parent().unwrap()).unwrap();
+        fs::write(&trusted, b"synthetic helper").unwrap();
+        let ambient = directory.join(&executable);
+        fs::write(&ambient, b"unreviewed helper").unwrap();
+        assert!(trusted_helper_under(&modules, &trusted, name));
+        assert!(!trusted_helper_under(&modules, &ambient, name));
+        assert!(!trusted_helper_under(&modules, &trusted, "aw-sync"));
+        #[cfg(unix)]
+        {
+            fs::remove_file(&trusted).unwrap();
+            std::os::unix::fs::symlink(&ambient, &trusted).unwrap();
+            assert!(!trusted_helper_under(&modules, &trusted, name));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn test_get_dirs() {

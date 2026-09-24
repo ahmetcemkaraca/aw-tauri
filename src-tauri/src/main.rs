@@ -3,9 +3,9 @@
 
 use clap::Parser;
 
-/// ActivityWatch UI built with Tauri
+/// PeakActivity desktop
 #[derive(Parser, Debug)]
-#[command(name = "aw-tauri", version, about)]
+#[command(name = "peakactivity", version, about)]
 struct Cli {
     /// Run in testing mode (port 5666, separate database)
     #[arg(long)]
@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     daemon: bool,
 
-    /// Run the lightweight tray/server mode without the Tauri WebView (~400 MB saved on Linux)
+    /// Deprecated alias for the native desktop; use --daemon for a headless local API
     #[arg(long, conflicts_with = "daemon")]
     mini: bool,
 }

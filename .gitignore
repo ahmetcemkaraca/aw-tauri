@@ -24,5 +24,4 @@ dist-ssr
 *.sw?
 
 # generated files
-src-tauri/icons/*
 /target/

@@ -88,8 +88,8 @@ pub fn run() {
                 tray_icon = Some(create_tray_icon(&modules));
                 if !first_run_notified && *crate::is_first_run() {
                     show_notification(
-                        "Aw-Tauri",
-                        "Welcome to Aw-Tauri! Use the tray icon to open the dashboard.",
+                        "PeakActivity",
+                        "Welcome to PeakActivity! Use the tray icon to open the dashboard.",
                     );
                     first_run_notified = true;
                 }
@@ -124,7 +124,7 @@ pub fn run() {
                 }
             }
             Event::UserEvent(MiniEvent::ServerFailed(msg)) => {
-                show_notification("ActivityWatch Error", &format!("Server failed: {msg}"));
+                show_notification("PeakActivity Error", &format!("Server failed: {msg}"));
                 if let Ok(mut state) = manager_state.lock() {
                     state.stop_modules();
                 }
@@ -154,7 +154,7 @@ fn create_tray_icon(modules: &manager::ModulesSnapshot) -> TrayIcon {
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)
-        .with_tooltip("ActivityWatch")
+        .with_tooltip("PeakActivity")
         .with_menu_on_left_click(true);
 
     #[cfg(target_os = "linux")]
@@ -203,7 +203,7 @@ fn build_tray_menu(modules: &manager::ModulesSnapshot) -> Result<Menu, Box<dyn s
     menu.append(&log_folder)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
-    let quit = MenuItem::with_id("quit", "Quit ActivityWatch", true, None);
+    let quit = MenuItem::with_id("quit", "Quit PeakActivity", true, None);
     menu.append(&quit)?;
 
     Ok(menu)

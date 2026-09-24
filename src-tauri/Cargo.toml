@@ -1,13 +1,17 @@
 [package]
-name = "aw-tauri"
+name = "peakactivity-desktop"
 version = "0.1.0"
-description = "ActivityWatch UI built with Tauri"
+description = "PeakActivity desktop, derived from ActivityWatch"
 authors = ["Erik Bjäreholt <erik@bjareho.lt>", "Brian Vuku <brayo@brayo.dev>"]
 license = "MPL-2.0"
-repository = "https://github.com/ActivityWatch/aw-tauri"
 edition = "2021"
+rust-version = "1.89"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "peakactivity"
+path = "src/main.rs"
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
@@ -36,21 +40,36 @@ notify-rust = "4.12.0"
 dirs = "5.0.1"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.140"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+base64 = "0.22"
 toml = "0.9.5"
 lazy_static = "1.5.0"
 log = "0.4.25"
 fern = { version = "0.7.1", features = ["colored"] }
 chrono = "0.4.39"
-aw-server = { git = "https://github.com/ActivityWatch/aw-server-rust.git", branch = "master" }
-aw-datastore = { git = "https://github.com/ActivityWatch/aw-server-rust.git", branch = "master" }
+aw-models = { path = "../../aw-server-rust/aw-models" }
+aw-server = { path = "../../aw-server-rust/aw-server", default-features = false, features = ["encryption-vendored"] }
+aw-datastore = { path = "../../aw-server-rust/aw-datastore", default-features = false, features = ["encryption-vendored"] }
+aw-sync-e2ee = { path = "../../aw-server-rust/aw-sync-e2ee" }
+aw-entitlements = { path = "../../aw-server-rust/aw-entitlements" }
 tauri-plugin-opener = "2"
 glob = "0.3.1"
 open = "5.3.3"
 png = "0.17.16"
+getrandom = "0.2"
+zeroize = { version = "1", features = ["alloc"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29.0", features = ["process", "signal"] }
 libc = "0.2"
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
 winapi = { version = "0.3.9", features = ["winuser", "jobapi2", "handleapi", "processthreadsapi", "winnt", "winbase"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

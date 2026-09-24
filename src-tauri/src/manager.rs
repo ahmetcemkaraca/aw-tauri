@@ -159,6 +159,7 @@ impl ManagerState {
     }
 
     pub fn start_module(&self, name: &str, args: Option<&Vec<String>>) {
+        if !crate::capture::allowed(name) { return; }
         if !self.is_module_running(name) {
             if let Some(module) = self.modules.get(name) {
                 // Fall back to the last known (or configured) args for this module, so manual
@@ -189,6 +190,10 @@ impl ManagerState {
             }
         }
     }
+    pub fn reset_capture_retries(&mut self) {
+        for module in self.modules.values_mut() { module.restart_count = 0; }
+    }
+
     pub fn stop_modules(&mut self) {
         let running: Vec<String> = self
             .modules
@@ -201,10 +206,8 @@ impl ManagerState {
         }
     }
     pub fn handle_system_click(&mut self, name: &str) {
-        if self.is_module_running(name) {
-            self.stop_module(name);
-        } else {
-            self.start_module(name, None);
+        if let Err(message) = crate::capture::toggle_source(name) {
+            let _ = self.tx.send(ModuleMessage::Notification { title: "Privacy controls".into(), message });
         }
     }
     fn is_module_running(&self, name: &str) -> bool {
@@ -219,6 +222,10 @@ struct TrayMenuCache {
     // sync checked-state in place instead of rebuilding the whole tray menu, which previously
     // happened on every Started/Stopped message.
     module_items: HashMap<String, CheckMenuItem<Wry>>,
+    capture_status: MenuItem<Wry>,
+    pause_items: Vec<MenuItem<Wry>>,
+    private_mode_item: MenuItem<Wry>,
+    resume_item: MenuItem<Wry>,
     // Names of modules in the running group (those started at least once) when the menu was last
     // built. The menu only needs rebuilding when this set changes (a module starts for the first
     // time and must move into the top group); crash-restart loops keep the module in the set and
@@ -271,28 +278,65 @@ fn update_tray_menu(modules: &ModulesSnapshot, event_tx: &Option<Sender<ManagerE
                     }
                 }
             }
+            let active = crate::capture::is_active();
+            if let Err(e) = c.capture_status.set_text(crate::capture::state_label()) {
+                error!("Failed to update tray capture status: {e}");
+            }
+            for item in &c.pause_items {
+                if let Err(e) = item.set_enabled(active) { error!("Failed to update tray pause control: {e}"); }
+            }
+            if let Err(e) = c.private_mode_item.set_enabled(active) {
+                error!("Failed to update Private Mode control: {e}");
+            }
+            if let Err(e) = c.resume_item.set_enabled(!active && crate::capture::can_resume()) {
+                error!("Failed to update tray resume control: {e}");
+            }
             trace!("synced tray menu state");
         }
         // First build, or a module joined the running group: rebuild to reorder the menu.
         _ => {
-            let module_items = build_tray_menu(app, modules);
-            *cache = Some(TrayMenuCache {
-                module_items,
-                running_keys,
-            });
+            *cache = Some(build_tray_menu(app, modules, running_keys));
             trace!("built tray menu");
         }
     }
 }
 
+pub(crate) fn refresh_tray_menu(state: &Arc<Mutex<ManagerState>>) {
+    if crate::is_daemon_mode() { return; }
+    let Ok(state) = state.lock() else { return; };
+    update_tray_menu(&state.modules_snapshot(), &None);
+}
+
 fn build_tray_menu(
     app: &AppHandle,
     modules: &ModulesSnapshot,
-) -> HashMap<String, CheckMenuItem<Wry>> {
+    running_keys: BTreeSet<String>,
+) -> TrayMenuCache {
     let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)
         .expect("failed to create open menu item");
-    let quit = MenuItem::with_id(app, "quit", "Quit ActivityWatch", true, None::<&str>)
+    let quit = MenuItem::with_id(app, "quit", "Quit PeakActivity", true, None::<&str>)
         .expect("failed to create quit menu item");
+    let active = crate::capture::is_active();
+    let capture_status = MenuItem::with_id(app, "capture_status", crate::capture::state_label(), false, None::<&str>)
+        .expect("failed to create capture status item");
+    let pause = MenuItem::with_id(app, "capture_pause", "Pause recording", active, None::<&str>)
+        .expect("failed to create pause item");
+    let pause_15 = MenuItem::with_id(app, "capture_pause_15", "Pause for 15 minutes", active, None::<&str>)
+        .expect("failed to create 15-minute pause item");
+    let pause_60 = MenuItem::with_id(app, "capture_pause_60", "Pause for 1 hour", active, None::<&str>)
+        .expect("failed to create 1-hour pause item");
+    let pause_tomorrow = MenuItem::with_id(app, "capture_pause_tomorrow", "Pause until tomorrow", active, None::<&str>)
+        .expect("failed to create until-tomorrow pause item");
+    let pause_submenu = SubmenuBuilder::new(app, "Pause temporarily")
+        .item(&pause_15)
+        .item(&pause_60)
+        .item(&pause_tomorrow)
+        .build()
+        .expect("failed to create pause submenu");
+    let private_mode_item = MenuItem::with_id(app, "capture_private", "Enter Private Mode", active, None::<&str>)
+        .expect("failed to create Private Mode item");
+    let resume_item = MenuItem::with_id(app, "capture_resume", "Resume recording", !active && crate::capture::can_resume(), None::<&str>)
+        .expect("failed to create resume item");
 
     let mut module_items = HashMap::new();
     let mut modules_submenu_builder = SubmenuBuilder::new(app, "Modules");
@@ -336,6 +380,12 @@ fn build_tray_menu(
         &[
             &open,
             &separator,
+            &capture_status,
+            &pause,
+            &pause_submenu,
+            &private_mode_item,
+            &resume_item,
+            &separator,
             &module_submenu,
             &separator,
             &config_folder,
@@ -352,7 +402,14 @@ fn build_tray_menu(
         .set_menu(Some(menu))
         .expect("Failed to set tray menu");
 
-    module_items
+    TrayMenuCache {
+        module_items,
+        capture_status,
+        pause_items: vec![pause, pause_15, pause_60, pause_tomorrow],
+        private_mode_item,
+        resume_item,
+        running_keys,
+    }
 }
 
 #[cfg(unix)]
@@ -525,15 +582,7 @@ fn start_manager_inner(
     let (tx, rx) = channel();
     let state = Arc::new(Mutex::new(ManagerState::new(tx.clone(), server_port)));
 
-    // Start the modules. Args come from the baseline computed in ManagerState::new().
-    let config = get_config();
-    for module_entry in config.autostart.modules.iter() {
-        let name = module_entry.name();
-        state
-            .lock()
-            .expect("Failed to acquire manager_state lock")
-            .start_module(name, None);
-    }
+    crate::capture::watch(Arc::clone(&state));
 
     // Force an initial tray build even if no modules autostart (no Started message would arrive).
     tx.send(ModuleMessage::Init {})
@@ -693,6 +742,26 @@ fn start_generic_module_thread(
     server_port: u16,
     tx: Sender<ModuleMessage>,
 ) {
+    if !crate::dirs::trusted_helper(&path, &name) {
+        error!("Capture helper is outside the reviewed resource directory; refusing to start it");
+        let _ = tx.send(ModuleMessage::Notification {
+            title: "Capture helper unavailable".into(),
+            message: "Reinstall the reviewed PeakActivity helpers; ambient PATH programs are not used for recording.".into(),
+        });
+        return;
+    }
+    let policy = match crate::capture::policy() {
+        Some(policy) if policy.permits_helper(&name, chrono::Utc::now()) => policy,
+        _ => return,
+    };
+    let capture_policy = match serde_json::to_string(&policy) { Ok(policy) => policy, Err(_) => return };
+    let token = match crate::local_session::collector_token(&name) {
+        Ok(token) => token,
+        Err(error) => {
+            error!("Capture helper was not started: {error}");
+            return;
+        }
+    };
     thread::spawn(move || {
         // Create job object on Windows to ensure child dies with parent
         #[cfg(windows)]
@@ -719,6 +788,11 @@ fn start_generic_module_thread(
 
         // Start the child process
         let mut command = Command::new(&path);
+        command.env("PEAKACTIVITY_API_TOKEN", &token.access_token)
+            .env("PEAKACTIVITY_API_REFRESH", &token.refresh_token)
+            .env("PEAKACTIVITY_API_ORIGIN", format!("http://127.0.0.1:{server_port}"))
+            .env("PEAKACTIVITY_CAPTURE", "1")
+            .env("PEAKACTIVITY_CAPTURE_POLICY", &capture_policy);
 
         // Use custom args if provided, otherwise only pass port arg if it's not the default (5600)
         if let Some(ref args) = custom_args {
@@ -1093,6 +1167,10 @@ fn discover_modules() -> BTreeMap<String, PathBuf> {
 
     let excluded = [
         "aw-tauri",
+        "peakactivity",
+        "aw-sync",
+        "aw-notify",
+        "aw-watcher-input",
         "aw-client",
         "aw-cli",
         "aw-qt",
@@ -1113,6 +1191,11 @@ fn discover_modules() -> BTreeMap<String, PathBuf> {
     }
 
     // Create new PATH-like string
+    // Bundled helpers take precedence over matching ambient PATH entries.
+    if let Some(modules) = crate::dirs::bundled_modules_dir() {
+        paths.insert(0, modules);
+    }
+
     let new_paths = env::join_paths(paths).unwrap_or_default();
 
     // Build a set of paths to search
@@ -1188,6 +1271,10 @@ fn discover_modules() -> BTreeMap<String, PathBuf> {
 fn discover_modules() -> BTreeMap<String, PathBuf> {
     let excluded = [
         "aw-tauri",
+        "peakactivity",
+        "aw-sync",
+        "aw-notify",
+        "aw-watcher-input",
         "aw-client",
         "aw-cli",
         "aw-qt",
@@ -1204,6 +1291,11 @@ fn discover_modules() -> BTreeMap<String, PathBuf> {
         if !paths.contains(path) {
             paths.insert(0, path.to_owned());
         }
+    }
+
+    // Bundled helpers take precedence over matching ambient PATH entries.
+    if let Some(modules) = crate::dirs::bundled_modules_dir() {
+        paths.insert(0, modules);
     }
 
     let new_paths = env::join_paths(paths).unwrap_or_default();

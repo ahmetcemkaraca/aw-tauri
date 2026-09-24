@@ -1,13 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "aw-tauri",
+  "productName": "PeakActivity",
   "version": "0.1.0",
-  "identifier": "net.activitywatch.tauri",
+  "identifier": "app.peakactivity.desktop",
   "app": {
     "windows": [],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

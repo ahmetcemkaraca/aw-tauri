@@ -19,9 +19,16 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod dirs;
+mod ai_credentials;
+mod entitlement;
 mod logging;
 mod manager;
 mod mini;
+mod vault;
+mod sync;
+mod vault_files;
+mod local_session;
+mod capture;
 
 /// CLI arguments passed from main()
 #[derive(Debug, Default)]
@@ -221,8 +228,8 @@ pub fn handle_first_run() {
             let app = &*get_app_handle().lock().expect("Failed to get app handle");
             app.notification()
                 .builder()
-                .title("Aw-Tauri")
-                .body("Welcome to Aw-Tauri! Click on the tray icon to launch the dashboard")
+                .title("PeakActivity")
+                .body("Welcome to PeakActivity! Click on the tray icon to launch the dashboard")
                 .show()
                 .expect("Failed to show first run notification");
             if let Some(window) = app.webview_windows().get("main") {
@@ -232,15 +239,8 @@ pub fn handle_first_run() {
     }
 }
 
-fn build_dashboard_url(port: u16, api_key: Option<&str>) -> Url {
-    let mut url =
-        Url::parse(&format!("http://localhost:{port}/")).expect("Failed to parse localhost url");
-
-    if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
-        url.query_pairs_mut().append_pair("token", api_key);
-    }
-
-    url
+fn build_dashboard_url(port: u16) -> Url {
+    Url::parse(&format!("http://127.0.0.1:{port}/")).expect("Invalid loopback URL")
 }
 
 pub fn listen_for_lockfile() {
@@ -398,13 +398,8 @@ impl Default for UserConfig {
             modules.push(ModuleEntry::Simple("aw-watcher-window".to_string()));
         }
 
-        modules.push(ModuleEntry::Full {
-            name: "aw-sync".to_string(),
-            args: "daemon".to_string(),
-        });
-
         UserConfig {
-            port: 5600,
+            port: 5601,
             discovery_paths,
             autostart: AutostartConfig {
                 enabled: true,
@@ -464,59 +459,12 @@ pub(crate) fn get_config() -> &'static UserConfig {
 /// is received, then cleanly stop all modules.
 fn run_daemon() {
     let cli_args = get_cli_args();
-    let testing = cli_args.testing;
-
-    let config = get_config();
-    let port = cli_args
-        .port
-        .unwrap_or(if testing { 5666 } else { config.port });
-
-    if !is_port_available(port).expect("Failed to check port availability") {
-        eprintln!("Error: port {} is already in use", port);
-        std::process::exit(1);
-    }
-
-    let mut aw_config = aw_server::config::create_config(testing);
-    aw_config.port = port;
-
-    let db_path = match aw_server::dirs::db_path(testing) {
-        Ok(path) => match path.to_str() {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("Error: database path is not valid UTF-8");
-                std::process::exit(1);
-            }
-        },
-        Err(_) => {
-            eprintln!("Error: failed to get db path");
+    let (_, server_state, aw_config) = prepare_aw_server(get_config(), cli_args)
+        .unwrap_or_else(|error| {
+            eprintln!("PeakActivity could not open its local vault: {error}");
             std::process::exit(1);
-        }
-    };
-    let device_id = aw_server::device_id::get_device_id();
-
-    let asset_path_opt = match std::env::var("AW_WEBUI_DIR") {
-        Ok(path_str) => {
-            let asset_path = PathBuf::from(&path_str);
-            if asset_path.exists() {
-                info!("Using webui path: {}", path_str);
-                Some(asset_path)
-            } else {
-                panic!("Path set via AW_WEBUI_DIR does not exist");
-            }
-        }
-        Err(_) => {
-            info!("Using bundled assets");
-            None
-        }
-    };
-
-    let server_state = aw_server::endpoints::ServerState {
-        datastore: Mutex::new(aw_datastore::Datastore::new(db_path, false)),
-        asset_resolver: aw_server::endpoints::AssetResolver::new(asset_path_opt),
-        device_id,
-    };
-
-    info!("Starting aw-tauri in daemon mode on port {port}");
+        });
+    let port = aw_config.port;
 
     // Build Tokio runtime first so we can spawn Rocket before starting modules
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -526,7 +474,16 @@ fn run_daemon() {
 
     // Spawn Rocket first so it begins binding the port before watchers start
     // connecting — matches the GUI path ordering (spawn then start_manager)
-    let rocket_handle = rt.spawn(build_rocket(server_state, aw_config).launch());
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let rocket_handle = rt.spawn(aw_server::endpoints::launch_with_readiness(server_state, aw_config, ready_tx));
+    if !matches!(ready_rx.recv_timeout(Duration::from_secs(15)), Ok(Ok(()))) {
+        eprintln!("PeakActivity could not bind its local API port");
+        std::process::exit(1);
+    }
+    if let Err(error) = vault::unlock() {
+        eprintln!("The local vault requires the native recovery interface: {error}");
+        std::process::exit(1);
+    }
 
     // Start module manager after Rocket is already starting up.
     // Pass the CLI-computed port so --testing and --port are respected.
@@ -553,6 +510,7 @@ fn run_daemon() {
     };
 
     info!("Server stopped, shutting down modules");
+    capture::stop();
     manager_state
         .lock()
         .expect("Failed to lock manager state")
@@ -570,14 +528,18 @@ pub(crate) fn prepare_aw_server(
     cli_args: &CliArgs,
 ) -> Result<(Url, ServerState, AWConfig), String> {
     let testing = cli_args.testing;
-    let legacy_import = false;
 
-    let mut aw_config = aw_server::config::create_config(testing);
+    let mut aw_config = AWConfig::default();
+    aw_config.testing = testing;
+    aw_config.address = "127.0.0.1".into();
 
     // Port priority: CLI flag > testing default (5666) > config file
-    let port = cli_args
-        .port
-        .unwrap_or(if testing { 5666 } else { user_config.port });
+    let mut port = cli_args.port.unwrap_or(if testing { 5667 } else { user_config.port });
+    if port == 0 { return Err("Choose a nonzero local server port".into()); }
+    if cli_args.port.is_none() && !is_port_available(port).map_err(|_| "Cannot inspect the local port")? {
+        port = TcpListener::bind(("127.0.0.1", 0)).and_then(|listener| listener.local_addr())
+            .map_err(|_| "No local server port is available")?.port();
+    }
     aw_config.port = port;
 
     // Check port availability before opening the datastore — opening the SQLite
@@ -586,14 +548,11 @@ pub(crate) fn prepare_aw_server(
         return Err(format!("Port {} is already in use", port));
     }
 
-    let db_path = aw_server::dirs::db_path(testing)
-        .map_err(|_| "Failed to get db path".to_string())?
-        .to_str()
-        .ok_or_else(|| "Database path is not valid UTF-8".to_string())?
-        .to_string();
-    let device_id = aw_server::device_id::get_device_id();
+    let datastore = vault::initialize(testing)?;
+    let device_id = vault::device_id(testing)?;
+    aw_config.auth.sessions = Some(local_session::initialize(port, testing)?);
 
-    let webui_var = std::env::var("AW_WEBUI_DIR");
+    let webui_var = if cfg!(debug_assertions) { std::env::var("AW_WEBUI_DIR") } else { Err(std::env::VarError::NotPresent) };
 
     let asset_path_opt = if let Ok(path_str) = &webui_var {
         let asset_path = PathBuf::from(path_str);
@@ -609,29 +568,15 @@ pub(crate) fn prepare_aw_server(
     };
 
     let server_state = ServerState {
-        datastore: Mutex::new(aw_datastore::Datastore::new(db_path, legacy_import)),
+        datastore,
         asset_resolver: aw_server::endpoints::AssetResolver::new(asset_path_opt),
         device_id,
     };
     if testing {
         info!("Running in testing mode (port {})", port);
     }
-    let dashboard_api_key = aw_config
-        .auth
-        .api_key
-        .as_deref()
-        .filter(|key| !key.is_empty());
-    if dashboard_api_key.is_some() {
-        info!("Bootstrapping aw-webui API token into dashboard URL");
-    }
-    let dashboard_url = build_dashboard_url(port, dashboard_api_key);
+    let dashboard_url = build_dashboard_url(port);
     Ok((dashboard_url, server_state, aw_config))
-}
-
-/// Run the lightweight mini mode: tray + server, no Tauri WebView.
-pub fn run_mini() {
-    MINI_MODE.set(true).expect("MINI_MODE already set");
-    mini::run();
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -642,14 +587,53 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn open_external(url: String, app: tauri::AppHandle) {
-    info!("Opening external URL in browser: {}", url);
-    if let Err(e) = app.opener().open_url(&url, None::<&str>) {
-        warn!("Failed to open URL in browser: {}", e);
+    let Ok(target) = Url::parse(&url) else { return; };
+    if !matches!(target.scheme(), "http" | "https") { return; }
+    info!("Opening an external link");
+    if app.opener().open_url(&url, None::<&str>).is_err() {
+        warn!("Unable to open external link");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn permission_settings_url(source: &str) -> Option<&'static str> {
+    matches!(source, "window" | "idle" | "browser").then_some("ms-settings:privacy")
+}
+
+#[cfg(target_os = "macos")]
+fn permission_settings_url(source: &str) -> Option<&'static str> {
+    matches!(source, "window" | "idle" | "browser")
+        .then_some("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn permission_settings_url(_source: &str) -> Option<&'static str> { None }
+
+#[tauri::command]
+fn open_permission_settings(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    source: String,
+) -> Result<bool, String> {
+    local_session::verify_window(&window)?;
+    if !matches!(source.as_str(), "window" | "idle" | "browser") {
+        return Err("Unsupported data source".into());
+    }
+    let Some(url) = permission_settings_url(&source) else { return Ok(false); };
+    app.opener().open_url(url, None::<&str>).map_err(|_| "System settings could not be opened")?;
+    Ok(true)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if let Ok(resource_dir) = tauri::utils::platform::resource_dir(
+        context.package_info(),
+        &tauri::Env::default(),
+    ) {
+        dirs::set_resource_dir(resource_dir);
+    }
     // Rotate log if needed (before initializing logging)
     if let Err(e) = logging::rotate_log_if_needed() {
         eprintln!("Failed to rotate log: {}", e);
@@ -675,8 +659,7 @@ pub fn run() {
     }
 
     if cli_args.mini {
-        run_mini();
-        return;
+        warn!("The browser-only mini mode has been retired; using the trusted native vault interface");
     }
 
     tauri::Builder::default()
@@ -731,66 +714,25 @@ pub fn run() {
                     }
                 }
 
-                let testing = cli_args.testing;
-                let legacy_import = false;
-
-                let mut aw_config = aw_server::config::create_config(testing);
-
-                // Port priority: CLI flag > testing default (5666) > config file
-                let port = cli_args
-                    .port
-                    .unwrap_or(if testing { 5666 } else { user_config.port });
-                aw_config.port = port;
-                let db_path = aw_server::dirs::db_path(testing)
-                    .expect("Failed to get db path")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                let device_id = aw_server::device_id::get_device_id();
-
-                let webui_var = std::env::var("AW_WEBUI_DIR");
-
-                let asset_path_opt = if let Ok(path_str) = &webui_var {
-                    let asset_path = PathBuf::from(&path_str);
-                    if asset_path.exists() {
-                        info!("Using webui path: {}", path_str);
-                        Some(asset_path)
-                    } else {
-                        panic!("Path set via env var AW_WEBUI_DIR does not exist");
+                let (dashboard_url, server_state, aw_config) = match prepare_aw_server(user_config, cli_args) {
+                    Ok(prepared) => prepared,
+                    Err(message) => {
+                        let handle = app.handle().clone();
+                        app.dialog().message(message).title("PeakActivity could not start")
+                            .kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
+                        return Ok(());
                     }
-                } else {
-                    info!("Using bundled assets");
-                    None
                 };
-
-                let server_state = aw_server::endpoints::ServerState {
-                    // Even if legacy_import is set to true it is disabled on Android so
-                    // it will not happen there
-                    datastore: Mutex::new(aw_datastore::Datastore::new(db_path, legacy_import)),
-                    asset_resolver: aw_server::endpoints::AssetResolver::new(asset_path_opt),
-                    device_id,
-                };
-                if !is_port_available(port).expect("Failed to check port availability") {
-                    app.dialog()
-                        .message(format!("Port {} is already in use", port))
-                        .kind(MessageDialogKind::Error)
-                        .title("Error")
-                        .show(|_| {});
-                    panic!("Port {} is already in use", port);
+                let port = aw_config.port;
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                tauri::async_runtime::spawn(aw_server::endpoints::launch_with_readiness(server_state, aw_config, ready_tx));
+                if !matches!(ready_rx.recv_timeout(Duration::from_secs(15)), Ok(Ok(()))) {
+                    let handle = app.handle().clone();
+                    app.dialog().message("The local server could not start. Close the conflicting application or choose another --port.")
+                        .title("Local server unavailable").kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
+                    return Ok(());
                 }
-                if testing {
-                    info!("Running in testing mode (port {})", port);
-                }
-                let dashboard_api_key = aw_config
-                    .auth
-                    .api_key
-                    .as_deref()
-                    .filter(|key| !key.is_empty());
-                if dashboard_api_key.is_some() {
-                    info!("Bootstrapping aw-webui API token into dashboard URL");
-                }
-                let dashboard_url = build_dashboard_url(port, dashboard_api_key);
-                tauri::async_runtime::spawn(build_rocket(server_state, aw_config).launch());
+                let trusted_origin = dashboard_url.origin();
                 // Create main window programmatically to attach initialization script.
                 // The script intercepts clicks on external links and opens them in the system
                 // browser via the open_external Tauri command. This approach works reliably for
@@ -801,7 +743,8 @@ pub fn run() {
                     "main",
                     tauri::WebviewUrl::External(dashboard_url),
                 )
-                .title("aw-tauri")
+                .title("PeakActivity")
+                .on_navigation(move |url| url.origin() == trusted_origin)
                 .inner_size(800.0, 600.0)
                 .visible(false)
                 .initialization_script(
@@ -809,7 +752,7 @@ pub fn run() {
                     document.addEventListener('click', function(e) {
                         var el = e.target;
                         while (el && el.tagName !== 'A') { el = el.parentElement; }
-                        if (el && el.href && !/^(https?:\/\/(localhost|127\.0\.0\.1)|tauri:|about:)/.test(el.href)) {
+                        if (el && el.href && new URL(el.href).origin !== window.location.origin) {
                             e.preventDefault();
                             e.stopPropagation();
                             window.__TAURI_INTERNALS__.invoke('open_external', { url: el.href });
@@ -819,11 +762,11 @@ pub fn run() {
                 )
                 .build()
                 .expect("Failed to create main window");
-                let manager_state = manager::start_manager();
+                let manager_state = manager::start_manager_with_port(port);
 
                 let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)
                     .expect("Failed to create open menu item");
-                let quit = MenuItem::with_id(app, "quit", "Quit ActivityWatch", true, None::<&str>)
+                let quit = MenuItem::with_id(app, "quit", "Quit PeakActivity", true, None::<&str>)
                     .expect("Failed to create quit menu item");
 
                 let menu =
@@ -848,7 +791,7 @@ pub fn run() {
                     )
                     .menu(&menu)
                     .show_menu_on_left_click(true)
-                    .tooltip("ActivityWatch");
+                    .tooltip("PeakActivity");
                 let tray = tray_builder.build(app).expect("Failed to create tray");
 
                 init_tray_id(tray.id().clone());
@@ -864,8 +807,28 @@ pub fn run() {
                         let mut state = manager_state
                             .lock()
                             .expect("Failed to acquire manager_state lock");
+                        drop(state);
+                        if let Err(error) = vault::lock() {
+                            warn!("Local vault did not confirm shutdown: {error}");
+                            return;
+                        }
+                        let mut state = manager_state.lock().expect("Failed to acquire manager_state lock");
                         state.stop_modules();
                         app.exit(0);
+                    } else if event.id().0.starts_with("capture_") {
+                        let result = match event.id().0.as_str() {
+                            "capture_pause" => capture::pause().map(|_| ()),
+                            "capture_pause_15" => capture::pause_for(chrono::Duration::minutes(15)).map(|_| ()),
+                            "capture_pause_60" => capture::pause_for(chrono::Duration::hours(1)).map(|_| ()),
+                            "capture_pause_tomorrow" => capture::pause_until_tomorrow().map(|_| ()),
+                            "capture_private" => capture::enter_private_mode().map(|_| ()),
+                            "capture_resume" => capture::resume().map(|_| ()),
+                            _ => Err("Unknown recording control".into()),
+                        };
+                        if let Err(message) = result {
+                            warn!("Tray recording control failed: {message}");
+                            let _ = app.notification().builder().title("Recording controls").body(message).show();
+                        }
                     } else if event.id().0 == "config_folder" {
                         let config_path = get_config_path();
                         let config_dir = config_path.parent().unwrap_or(&config_path);
@@ -886,13 +849,21 @@ pub fn run() {
                         state.handle_system_click(&event.id().0);
                     }
                 });
-                if user_config.autostart.enabled && !user_config.autostart.minimized {
+                if !user_config.autostart.minimized || *is_first_run() || !vault::status().has_vault {
                     if let Some(window) = app.webview_windows().get("main") {
                         window.show().expect("Failed to show main window");
                     }
                 }
             }
 
+            if vault::status().has_vault {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if vault::unlock().is_err() {
+                        if let Some(window) = handle.get_webview_window("main") { let _ = window.show(); }
+                    }
+                });
+            }
             handle_first_run();
             listen_for_lockfile();
             Ok(())
@@ -904,36 +875,63 @@ pub fn run() {
             };
         })
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![greet, open_external])
-        .run(tauri::generate_context!())
+        .invoke_handler(tauri::generate_handler![greet, open_external, open_permission_settings, local_session::local_session,
+            ai_credentials::save_ai_credential, ai_credentials::delete_ai_credential,
+            ai_credentials::has_ai_credential, ai_credentials::send_ai_request,
+            local_session::pause_capture, local_session::pause_capture_for, local_session::pause_capture_until_tomorrow,
+            local_session::enter_private_mode, local_session::resume_capture, local_session::capture_runtime,
+            entitlement::install_signed_entitlement, entitlement::load_entitlement_status,
+            vault::vault_status, vault::unlock_vault, vault::lock_vault, vault::backup_vault,
+            vault::restore_vault, vault::rotate_vault_key, vault::rollback_vault, vault::delete_local_vault,
+            vault::support_bundle_preview, vault::export_support_bundle, vault::repair_privacy,
+            sync::list_sync_devices, sync::create_local_sync_identity, sync::create_sync_pairing, sync::respond_sync_pairing,
+            sync::complete_sync_pairing, sync::prepare_sync_pairing, sync::confirm_sync_pairing,
+            sync::create_sync_key_transfer, sync::accept_sync_key_transfer,
+            sync::list_sync_device_access_history, sync::list_sync_tombstone_statuses,
+            sync::revoke_sync_device,
+            sync::rotate_sync_keys,
+            sync::create_current_sync_snapshot,
+            sync::create_sync_recovery_kit, sync::verify_sync_recovery_kit,
+            sync::export_sync_snapshot,
+            sync::preview_sync_recovery_restore, sync::restore_sync_recovery_kit,
+            sync::confirm_sync_recovery_saved,
+            sync::sync_recovery_confirmed, sync::cancel_sync_recovery_kit,
+            sync::cancel_sync_pairing])
+        .run(context)
         .expect("error while running tauri application");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_dashboard_url;
-
     #[test]
-    fn build_dashboard_url_omits_token_when_auth_disabled() {
-        assert_eq!(
-            build_dashboard_url(5600, None).as_str(),
-            "http://localhost:5600/"
-        );
+    fn dashboard_url_never_carries_credentials() {
+        let url = super::build_dashboard_url(5600);
+        assert_eq!(url.as_str(), "http://127.0.0.1:5600/");
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
     }
 
     #[test]
-    fn build_dashboard_url_ignores_empty_api_keys() {
-        assert_eq!(
-            build_dashboard_url(5600, Some("")).as_str(),
-            "http://localhost:5600/"
-        );
+    fn permission_settings_target_is_fixed_or_manual() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(super::permission_settings_url("window"), Some("ms-settings:privacy"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::permission_settings_url("window"), Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"));
+        #[cfg(target_os = "linux")]
+        assert_eq!(super::permission_settings_url("window"), None);
+        assert_eq!(super::permission_settings_url("unknown"), None);
     }
+}
+
+#[cfg(test)]
+mod shipping_tests {
+    use super::UserConfig;
 
     #[test]
-    fn build_dashboard_url_appends_encoded_token() {
-        assert_eq!(
-            build_dashboard_url(5600, Some("secret+ /?=&")).as_str(),
-            "http://localhost:5600/?token=secret%2B+%2F%3F%3D%26"
-        );
+    fn default_modules_are_capture_helpers_only() {
+        let config = UserConfig::default();
+        assert!(!config.autostart.modules.is_empty());
+        assert!(config.autostart.modules.iter().all(|module|
+            matches!(module.name(), "aw-watcher-afk" | "aw-watcher-window" | "aw-awatcher")));
     }
 }

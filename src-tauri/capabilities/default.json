@@ -10,5 +10,11 @@
     "shell:allow-open",
     "dialog:default",
     "opener:default"
-  ]
+  ],
+  "remote": {
+    "urls": [
+      "http://localhost:*",
+      "http://127.0.0.1:*"
+    ]
+  }
 }

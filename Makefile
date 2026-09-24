@@ -4,6 +4,8 @@ else
 	ARCH :=
 endif
 OS := $(shell uname -s)
+WEBUI_DIR ?= aw-webui
+export AW_WEBUI_DIR := $(abspath $(WEBUI_DIR)/dist)
 
 build: prebuild
 	npm run tauri build
@@ -14,14 +16,14 @@ dev: prebuild
 %/.git:
 	git submodule update --init --recursive
 
-src-tauri/icons/icon.png: aw-webui/.git
+src-tauri/icons/icon.png: $(WEBUI_DIR)/static/peakactivity.svg node_modules
 	mkdir -p src-tauri/icons
-	npm run tauri icon "./aw-webui/media/logo/logo.png"
+	npm run tauri icon "$(WEBUI_DIR)/static/peakactivity.svg"
 
-aw-webui/dist: aw-webui/.git
-	cd aw-webui && make build
+$(WEBUI_DIR)/dist: $(WEBUI_DIR)/.git
+	$(MAKE) -C "$(WEBUI_DIR)" build
 
-prebuild: aw-webui/dist node_modules src-tauri/icons/icon.png
+prebuild: $(WEBUI_DIR)/dist node_modules src-tauri/icons/icon.png
 
 precommit: format check
 
@@ -33,19 +35,19 @@ check:
 
 package:
 ifeq ($(OS),Linux)
-	rm -rf target/package/aw-tauri
-	mkdir -p target/package/aw-tauri
-	cp src-tauri/target/release/bundle/deb/*.deb target/package/aw-tauri/aw-tauri$(ARCH).deb
-	cp src-tauri/target/release/bundle/rpm/*.rpm target/package/aw-tauri/aw-tauri$(ARCH).rpm
-	cp src-tauri/target/release/bundle/appimage/*.AppImage target/package/aw-tauri/aw-tauri$(ARCH).AppImage
+	rm -rf target/package/peakactivity
+	mkdir -p target/package/peakactivity
+	cp src-tauri/target/release/bundle/deb/*.deb target/package/peakactivity/peakactivity$(ARCH).deb
+	cp src-tauri/target/release/bundle/rpm/*.rpm target/package/peakactivity/peakactivity$(ARCH).rpm
+	cp src-tauri/target/release/bundle/appimage/*.AppImage target/package/peakactivity/peakactivity$(ARCH).AppImage
 
-	mkdir -p dist/aw-tauri
-	rm -rf dist/aw-tauri/*
-	cp target/package/aw-tauri/* dist/aw-tauri/
+	mkdir -p dist/peakactivity
+	rm -rf dist/peakactivity/*
+	cp target/package/peakactivity/* dist/peakactivity/
 else
 	rm -rf target/package
 	mkdir -p target/package
-	cp src-tauri/target/release/aw-tauri target/package/aw-tauri
+	cp src-tauri/target/release/peakactivity target/package/peakactivity
 
 	mkdir -p dist
 	find dist/ -maxdepth 1 -type f -delete 2>/dev/null || true
