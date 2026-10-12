@@ -7,6 +7,8 @@ OS := $(shell uname -s)
 WEBUI_DIR ?= aw-webui
 export AW_WEBUI_DIR := $(abspath $(WEBUI_DIR)/dist)
 
+.PHONY: $(WEBUI_DIR)/dist
+
 build: prebuild
 	npm run tauri build
 
