@@ -853,6 +853,35 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires an isolated, unlocked native OS secret service"]
+    fn native_keyring_roundtrip_and_missing_existing_vault_fail_closed() {
+        // Unique service avoids touching the user's real vault or credential index.
+        let service = format!("app.peakactivity.native-test.{}", std::process::id());
+        let credential = Entry::new(&service, "synthetic-vault").unwrap();
+        assert!(matches!(credential.get_password(), Err(Error::NoEntry)));
+        let secret = key(&credential, false).unwrap();
+        assert_eq!(secret.len(), 64);
+        let reopened = Entry::new(&service, "synthetic-vault").unwrap();
+        assert!(*key(&reopened, true).unwrap() == *secret);
+        let directory = std::env::temp_dir().join(&service);
+        fs::create_dir(&directory).unwrap();
+        let database = directory.join("activity.db");
+        let store = Datastore::open_encrypted(database.to_str().unwrap().into(), secret.to_string()).unwrap();
+        store.set_key_value("native-check", "synthetic private value").unwrap();
+        store.close();
+        let bytes = fs::read(&database).unwrap();
+        assert!(!bytes.starts_with(b"SQLite format 3"));
+        assert!(!bytes.windows(23).any(|part| part == b"synthetic private value"));
+        aw_datastore::vault::verify(&database, &key(&reopened, true).unwrap()).unwrap();
+        assert!(aw_datastore::vault::verify(&database, &"0".repeat(64)).is_err());
+        reopened.delete_credential().unwrap();
+        assert!(key(&credential, true).is_err());
+        assert!(matches!(credential.get_password(), Err(Error::NoEntry)));
+        assert_eq!(fs::read(&database).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn existing_vault_never_gets_a_replacement_key() {
         let entry = Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
         assert!(key(&entry, true).is_err());
