@@ -5,7 +5,7 @@ description = "PeakActivity desktop, derived from ActivityWatch"
 authors = ["Erik Bjäreholt <erik@bjareho.lt>", "Brian Vuku <brayo@brayo.dev>"]
 license = "MPL-2.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.96"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -48,7 +48,7 @@ log = "0.4.25"
 fern = { version = "0.7.1", features = ["colored"] }
 chrono = "0.4.39"
 aw-models = { path = "../../aw-server-rust/aw-models" }
-aw-server = { path = "../../aw-server-rust/aw-server", default-features = false, features = ["encryption-vendored"] }
+aw-server = { path = "../../aw-server-rust/aw-server", default-features = false, features = ["encryption-vendored", "plugin-runtime"] }
 aw-datastore = { path = "../../aw-server-rust/aw-datastore", default-features = false, features = ["encryption-vendored"] }
 aw-sync-e2ee = { path = "../../aw-server-rust/aw-sync-e2ee" }
 aw-entitlements = { path = "../../aw-server-rust/aw-entitlements" }

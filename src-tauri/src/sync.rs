@@ -1201,7 +1201,7 @@ mod tests {
         ).unwrap();
         store.put_sync_object(envelope, paired_at.into()).unwrap();
         store.acknowledge_sync_tombstone(
-            first_peer, 88, 5, first_peer, "2026-09-23T12:01:00Z",
+            first_peer, 88, 5, first_peer, "2026-09-23T12:01:00Z".into(),
         ).unwrap();
 
         let statuses = list_sync_tombstone_statuses_from_store(&store).unwrap();

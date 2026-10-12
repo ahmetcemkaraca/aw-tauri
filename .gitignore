@@ -25,3 +25,4 @@ dist-ssr
 
 # generated files
 /target/
+__pycache__/
