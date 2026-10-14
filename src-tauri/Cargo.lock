@@ -450,6 +450,7 @@ name = "aw-egress"
 version = "0.1.0"
 dependencies = [
  "aw-datastore",
+ "aw-entitlements",
  "aw-models",
  "aw-sync-e2ee",
  "base64 0.22.1",
@@ -511,6 +512,7 @@ dependencies = [
  "plex",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -521,6 +523,7 @@ dependencies = [
  "aw-client-rust",
  "aw-datastore",
  "aw-egress",
+ "aw-entitlements",
  "aw-models",
  "aw-plugin-runtime",
  "aw-query",
@@ -4248,6 +4251,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shell-words",
  "tao",
  "tauri",
@@ -4258,6 +4262,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
+ "tempfile",
  "tokio",
  "toml 0.9.6",
  "tray-icon",

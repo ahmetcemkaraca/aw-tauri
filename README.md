@@ -35,6 +35,14 @@ uses expiring scoped sessions; the main WebView acquires its credential by nativ
 IPC, and capture helpers receive process-bound renewal grants. External browser
 views in mini mode do not yet have a pairing flow and cannot authorize themselves. Use synthetic activity.
 
+Encrypted sync recovery uses Core's v1 snapshot with activity, stable event
+identities, operation counters, stream checkpoints and tombstone acknowledgements.
+Native restores validate a clean, paused target, stage and verify the SQLCipher
+database, and retain the previous file and key for rollback. Recovery creates a
+fresh local sync identity. Pairing and recovery phrases cannot be pending together;
+vault locking clears both pending states. Saving or cancelling a recovery phrase
+preserves the installed sync keys.
+
 ## Verification scope
 
 `make check` checks Rust compilation and linting after prebuild. Windows, macOS

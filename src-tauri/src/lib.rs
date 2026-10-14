@@ -15,13 +15,14 @@ use std::thread;
 use std::time::Duration;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod dirs;
 mod ai_credentials;
 mod entitlement;
 mod logging;
+mod notifications;
+mod updates;
 mod manager;
 mod mini;
 mod vault;
@@ -225,13 +226,8 @@ pub fn handle_first_run() {
     let first_run = is_first_run();
     if *first_run {
         thread::spawn(|| {
+            notifications::notify(notifications::Code::Welcome);
             let app = &*get_app_handle().lock().expect("Failed to get app handle");
-            app.notification()
-                .builder()
-                .title("PeakActivity")
-                .body("Welcome to PeakActivity! Click on the tray icon to launch the dashboard")
-                .show()
-                .expect("Failed to show first run notification");
             if let Some(window) = app.webview_windows().get("main") {
                 window.show().expect("Failed to show main window");
             }
@@ -532,6 +528,7 @@ pub(crate) fn prepare_aw_server(
     let mut aw_config = AWConfig::default();
     aw_config.testing = testing;
     aw_config.address = "127.0.0.1".into();
+    aw_config.feature_access = entitlement::runtime();
 
     // Port priority: CLI flag > testing default (5666) > config file
     let mut port = cli_args.port.unwrap_or(if testing { 5667 } else { user_config.port });
@@ -825,9 +822,9 @@ pub fn run() {
                             "capture_resume" => capture::resume().map(|_| ()),
                             _ => Err("Unknown recording control".into()),
                         };
-                        if let Err(message) = result {
-                            warn!("Tray recording control failed: {message}");
-                            let _ = app.notification().builder().title("Recording controls").body(message).show();
+                        if result.is_err() {
+                            warn!("Tray recording control failed; review the local recording status");
+                            notifications::notify(notifications::Code::RecordingControlFailed);
                         }
                     } else if event.id().0 == "config_folder" {
                         let config_path = get_config_path();
@@ -876,6 +873,8 @@ pub fn run() {
         })
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![greet, open_external, open_permission_settings, local_session::local_session,
+            notifications::notification_history, notifications::clear_notification_history,
+            updates::update_integrity_status, updates::verify_update_bundle,
             ai_credentials::save_ai_credential, ai_credentials::delete_ai_credential,
             ai_credentials::has_ai_credential, ai_credentials::send_ai_request,
             local_session::pause_capture, local_session::pause_capture_for, local_session::pause_capture_until_tomorrow,
@@ -893,6 +892,9 @@ pub fn run() {
             sync::create_current_sync_snapshot,
             sync::create_sync_recovery_kit, sync::verify_sync_recovery_kit,
             sync::export_sync_snapshot,
+            sync::get_sync_backup_context, sync::list_sync_backups, sync::export_selected_sync_backup,
+            sync::preview_sync_backup_delete, sync::delete_selected_sync_backup,
+            sync::preview_selected_sync_backup_restore, sync::restore_selected_sync_backup,
             sync::preview_sync_recovery_restore, sync::restore_sync_recovery_kit,
             sync::confirm_sync_recovery_saved,
             sync::sync_recovery_confirmed, sync::cancel_sync_recovery_kit,

@@ -109,5 +109,6 @@ pub fn capture_runtime(window: tauri::WebviewWindow) -> Result<serde_json::Value
 }
 
 pub fn revoke_all() {
+    crate::vault::invalidate_reports();
     if let Some(sessions) = SESSIONS.get() { sessions.revoke_all(); }
 }

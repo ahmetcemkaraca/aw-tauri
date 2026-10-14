@@ -1,0 +1,94 @@
+name: Desktop critical checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.98.1'
+      AW_WEBUI_DIR: ${{ github.workspace }}/aw-tauri/aw-webui/dist
+      EXPECTED_CORE_REV: 78502ccd11f30dc0f19b7100ef66f71bdc57718f
+      EXPECTED_WEBUI_REV: 9ab60a2cc406102749fbe53cb760d4f817fe7711
+    defaults:
+      run:
+        working-directory: aw-tauri
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+          path: aw-tauri
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          repository: ahmetcemkaraca/aw-server-rust
+          ref: 78502ccd11f30dc0f19b7100ef66f71bdc57718f
+          path: aw-server-rust
+          submodules: recursive
+      - name: Verify reviewed dependency sources
+        run: |
+          test "$(git -C ../aw-server-rust rev-parse HEAD)" = "$EXPECTED_CORE_REV"
+          test "$(git -C ../aw-server-rust rev-parse HEAD:aw-webui)" = "$EXPECTED_WEBUI_REV"
+          test "$(git -C ../aw-server-rust/aw-webui rev-parse HEAD)" = "$EXPECTED_WEBUI_REV"
+          test "$(git rev-parse HEAD:aw-webui)" = "$EXPECTED_WEBUI_REV"
+          test "$(git -C aw-webui rev-parse HEAD)" = "$EXPECTED_WEBUI_REV"
+          git submodule status --recursive
+          git -C ../aw-server-rust submodule status --recursive
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+      - name: Install native toolchain and Linux dependencies
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev gnome-keyring dbus-x11
+      - name: Check real Make asset prerequisite
+        run: python3 -m unittest discover -s tests -p 'test_prebuild.py' -v
+      - name: Build real embedded WebUI and desktop icons
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix aw-webui --no-audit --no-fund
+          make prebuild
+          test -s "$AW_WEBUI_DIR/index.html"
+          test -s "$AW_WEBUI_DIR/peakactivity.svg"
+          test -s "$AW_WEBUI_DIR/LICENSE.txt"
+      - name: Build encrypted Linux desktop
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --locked --bin peakactivity
+          ./src-tauri/target/debug/peakactivity --help >/dev/null
+      - name: Check vault, credential and sync boundaries
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib vault::tests::existing_vault_never_gets_a_replacement_key -- --exact --test-threads=1
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib vault::tests::key_store_errors_never_trigger_plaintext_fallback -- --exact --test-threads=1
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib ai_credentials::tests::credential_refs_and_bearer_values_are_strictly_bounded -- --exact --test-threads=1
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib sync::tests::tombstone_status_lists_unacknowledged_devices_without_event_values -- --exact --test-threads=1
+      - name: Check native Secret Service and SQLCipher in isolation
+        run: |
+          export XDG_DATA_HOME="$RUNNER_TEMP/native-keyring/data"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/native-keyring/config"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/native-keyring/cache"
+          mkdir -p -m 700 "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          dbus-run-session -- bash -euo pipefail -c '
+            printf %s synthetic-ci-keyring | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --lib vault::tests::native_keyring_roundtrip_and_missing_existing_vault_fail_closed -- --ignored --exact --test-threads=1
+          '
+      - name: Check dependency locks are unchanged
+        run: |
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
+          git -C aw-webui diff --exit-code -- package-lock.json
+          git -C ../aw-server-rust diff --exit-code -- Cargo.lock

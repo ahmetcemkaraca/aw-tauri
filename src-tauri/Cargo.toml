@@ -58,6 +58,8 @@ open = "5.3.3"
 png = "0.17.16"
 getrandom = "0.2"
 zeroize = { version = "1", features = ["alloc"] }
+sha2 = "=0.10.9"
+tempfile = "=3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }

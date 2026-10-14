@@ -46,7 +46,6 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::{get_app_handle, get_config, get_tray_id, HANDLE_CONDVAR};
 use std::io::{BufRead, BufReader};
-use tauri_plugin_notification::NotificationExt;
 
 #[derive(Debug)]
 enum ModuleMessage {
@@ -1093,71 +1092,32 @@ fn start_notify_module_thread(
     });
 }
 
-/// Route a notification: send via ManagerEvent channel (mini mode) or Tauri (GUI mode).
-fn route_notification(event_tx: &Option<Sender<ManagerEvent>>, title: &str, message: &str) {
-    if let Some(tx) = event_tx {
-        let _ = tx.send(ManagerEvent::Notification {
-            title: title.to_string(),
-            message: message.to_string(),
-        });
-        return;
-    }
-    send_tauri_notification(title, message);
+/// Record and route fixed local notification copy through the native history.
+fn route_notification(_event_tx: &Option<Sender<ManagerEvent>>, title: &str, _message: &str) {
+    let code = match title {
+        "Privacy controls" | "Recording controls" => crate::notifications::Code::RecordingControlFailed,
+        "Capture helper unavailable" => crate::notifications::Code::CaptureSourceUnavailable,
+        _ => crate::notifications::Code::LocalNotice,
+    };
+    crate::notifications::notify(code);
 }
 
-/// Route a warning dialog: send via ManagerEvent channel (mini mode) or Tauri dialog (GUI mode).
-fn show_warning(event_tx: &Option<Sender<ManagerEvent>>, message: &str) {
-    if let Some(tx) = event_tx {
-        let _ = tx.send(ManagerEvent::Notification {
-            title: "Warning".to_string(),
-            message: message.to_string(),
-        });
-        return;
-    }
+/// Keep a fixed source warning in local history and the existing native dialog.
+fn show_warning(_event_tx: &Option<Sender<ManagerEvent>>, _message: &str) {
+    let code = crate::notifications::Code::CaptureSourceStopped;
+    crate::notifications::record_suppressed(code);
     if crate::is_daemon_mode() {
-        warn!("{message}");
+        warn!("A data source stopped; open PeakActivity to review its status");
         return;
     }
-    let app = &*get_app_handle().lock().expect("Failed to get app handle");
-    app.dialog()
-        .message(message)
-        .kind(MessageDialogKind::Warning)
-        .title("Warning")
-        .show(|_| {});
-}
-
-fn send_tauri_notification(title: &str, message: &str) {
-    if crate::is_daemon_mode() {
-        info!(
-            "Notification (suppressed in daemon mode): {} — {}",
-            title, message
-        );
-        return;
-    }
-    // Get app handle and send notification
-    if let Ok(app_handle_guard) = get_app_handle().lock() {
-        let app_handle = &*app_handle_guard;
-        let result = app_handle
-            .notification()
-            .builder()
-            .title(title)
-            .body(message)
-            .show();
-
-        match result {
-            Ok(_) => {
-                trace!(
-                    "Sent notification: title='{}', message preview='{}'",
-                    title,
-                    message.lines().next().unwrap_or("")
-                );
-            }
-            Err(e) => {
-                error!("Failed to send notification: {}", e);
-            }
-        }
+    if let Ok(app) = get_app_handle().lock() {
+        app.dialog()
+            .message(code.body())
+            .kind(MessageDialogKind::Warning)
+            .title(code.title())
+            .show(|_| {});
     } else {
-        error!("Failed to get app handle lock for notification");
+        error!("Unable to show the data source warning");
     }
 }
 
